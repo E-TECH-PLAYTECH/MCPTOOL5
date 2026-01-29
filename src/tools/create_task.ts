@@ -1,10 +1,11 @@
 import { z } from "zod";
 import { v5 as uuidv5 } from "uuid";
+import { store } from "../core/store/db.js";
 import { buildEnvelope } from "../core/audit/envelope.js";
 import { canonicalize, computeHash } from "../core/audit/canonical.js";
-import { store } from "../core/store/db.js";
 
 const TASK_NAMESPACE = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+const EPOCH = "1970-01-01T00:00:00.000Z";
 
 export const CreateTaskInputSchema = z.object({
   request_id: z.string().optional(),
@@ -24,120 +25,100 @@ export const CreateTaskInputSchema = z.object({
 
 export const CreateTaskTool = {
   name: "create_task",
-  version: "1.0.1",
+  version: "2.0.0",
 
   execute: async (input: z.infer<typeof CreateTaskInputSchema>) => {
     const { task, mode, reference_time, idempotency_key } = input;
 
-    // Deterministic schedule resolution
     let next_run_at: string;
-    if (task.schedule.run_at) {
-      next_run_at = task.schedule.run_at;
-    } else if (task.schedule.interval_seconds) {
+    if (task.schedule.run_at) next_run_at = task.schedule.run_at;
+    else if (task.schedule.interval_seconds) {
       if (!reference_time) {
         return buildEnvelope({
           request_id: input.request_id,
           tool_name: "create_task",
-          tool_version: "1.0.1",
+          tool_version: "2.0.0",
           input,
           result: null,
-          errors: [{
-            code: "ERR_DETERMINISM",
-            message: "reference_time is required when using interval_seconds",
-            path: "reference_time"
-          }]
+          errors: [{ code: "ERR_DETERMINISM", message: "reference_time required for interval scheduling", path: "reference_time" }]
         });
       }
       const base = new Date(reference_time).getTime();
-      const target = base + task.schedule.interval_seconds * 1000;
-      next_run_at = new Date(target).toISOString();
+      next_run_at = new Date(base + task.schedule.interval_seconds * 1000).toISOString();
     } else {
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "create_task",
-        tool_version: "1.0.1",
+        tool_version: "2.0.0",
         input,
         result: null,
-        errors: [{ code: "ERR_INVALID_SCHEDULE", message: "Either run_at or interval_seconds is required." }]
+        errors: [{ code: "ERR_INVALID_SCHEDULE", message: "run_at or interval_seconds required", path: "task.schedule" }]
       });
     }
 
-    // Normalize task deterministically
+    const created_at = reference_time ?? task.schedule.run_at ?? EPOCH;
+
     const normalized_task = {
       title: task.title.trim(),
       action: task.action.toLowerCase().trim(),
       payload: task.payload,
-      status: "pending",
       schedule: { next_run_at }
     };
 
-    // Deterministic task_id
-    const seed =
+    const task_json = canonicalize(normalized_task);
+
+    const task_id =
       mode === "commit"
-        ? (idempotency_key ?? "")
-        : computeHash(normalized_task);
+        ? (idempotency_key ? uuidv5(idempotency_key, TASK_NAMESPACE) : "")
+        : uuidv5(computeHash(normalized_task), TASK_NAMESPACE);
 
     if (mode === "commit" && !idempotency_key) {
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "create_task",
-        tool_version: "1.0.1",
+        tool_version: "2.0.0",
         input,
         result: null,
-        errors: [{ code: "ERR_IDEMPOTENCY_REQUIRED", message: "idempotency_key is required for commit mode", path: "idempotency_key" }]
+        errors: [{ code: "ERR_IDEMPOTENCY_REQUIRED", message: "idempotency_key required for commit mode", path: "idempotency_key" }]
       });
     }
-
-    const task_id = uuidv5(seed, TASK_NAMESPACE);
-    const payload_json = canonicalize(normalized_task.payload);
 
     if (mode === "dry_run") {
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "create_task",
-        tool_version: "1.0.1",
+        tool_version: "2.0.0",
         input,
-        result: {
-          would_create: true,
-          task_id,
-          normalized_task
-        }
+        result: { would_create: true, task_id, normalized_task, created_at, next_run_at }
       });
     }
 
-    // commit mode (SQLite-backed, idempotent)
     const db = store.db;
 
     const tx = db.transaction(() => {
-      const existing = db.prepare(`SELECT * FROM tasks WHERE task_id = ?`).get(task_id) as any;
+      const existing = db.prepare(`SELECT task_id, task_json, status, next_run_at, created_at FROM tasks WHERE task_id = ?`).get(task_id) as any;
       if (existing) {
         return {
           status: "idempotent_hit" as const,
-          task_id,
-          normalized_task: {
-            title: existing.title,
-            action: existing.action,
-            payload: JSON.parse(existing.payload_json),
-            status: existing.status,
-            schedule: { next_run_at: existing.next_run_at }
-          }
+          task_id: existing.task_id as string,
+          normalized_task: JSON.parse(existing.task_json),
+          created_at: existing.created_at as string,
+          next_run_at: existing.next_run_at as string
         };
       }
 
       db.prepare(`
-        INSERT INTO tasks(task_id, idempotency_key, title, action, payload_json, status, next_run_at)
-        VALUES(?, ?, ?, ?, ?, ?, ?)
-      `).run(
-        task_id,
-        idempotency_key!,
-        normalized_task.title,
-        normalized_task.action,
-        payload_json,
-        normalized_task.status,
-        next_run_at
-      );
+        INSERT INTO tasks(task_id, idempotency_key, task_json, status, next_run_at, created_at)
+        VALUES(?, ?, ?, 'pending', ?, ?)
+      `).run(task_id, idempotency_key!, task_json, next_run_at, created_at);
 
-      return { status: "created" as const, task_id, normalized_task };
+      return {
+        status: "created" as const,
+        task_id,
+        normalized_task,
+        created_at,
+        next_run_at
+      };
     });
 
     const out = tx();
@@ -145,10 +126,10 @@ export const CreateTaskTool = {
     return buildEnvelope({
       request_id: input.request_id,
       tool_name: "create_task",
-      tool_version: "1.0.1",
+      tool_version: "2.0.0",
       input,
       result: out,
-      provenance: [{ source_type: "db", source_id: "tasks", artifact_id: task_id }]
+      provenance: [{ source_type: "db", source_id: "tasks", artifact_id: out.task_id }]
     });
   }
 };

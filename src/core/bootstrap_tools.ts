@@ -8,32 +8,34 @@ import { RetrieveTool, RetrieveInputSchema } from "../tools/retrieve.js";
 import { CommitIndexTool, CommitIndexInputSchema } from "../tools/commit_index.js";
 import { LogIndexTool, LogIndexInputSchema } from "../tools/log_index.js";
 import { DiffIndexTool, DiffIndexInputSchema } from "../tools/diff_index.js";
-import { ValidateSchemaTool, ValidateSchemaInputSchema } from "../tools/validate_schema.js";
-import { CheckSupportTool, CheckSupportInputSchema } from "../tools/check_support.js";
-import { RedactTool, RedactInputSchema } from "../tools/redact.js";
 import { CreateTaskTool, CreateTaskInputSchema } from "../tools/create_task.js";
+import { BuildEmbeddingsTool, BuildEmbeddingsInputSchema } from "../tools/build_embeddings.js";
+import { RetrieveWithEmbeddingsTool, RetrieveWithEmbeddingsInputSchema } from "../tools/retrieve_with_embeddings.js";
+import { GcArtifactsTool, GcArtifactsInputSchema } from "../tools/gc_artifacts.js";
+import { CheckoutIndexTool, CheckoutIndexInputSchema } from "../tools/checkout_index.js";
 
 const SYSTEM_TOOLS = [
-  { def: RetrieveTool, schema: RetrieveInputSchema, desc: "Deterministic keyword retrieval over indexed chunks." },
-  { def: CommitIndexTool, schema: CommitIndexInputSchema, desc: "Explicitly commit the current working tree into a deterministic DAG." },
-  { def: LogIndexTool, schema: LogIndexInputSchema, desc: "Walk first-parent history from a ref or commit hash." },
-  { def: DiffIndexTool, schema: DiffIndexInputSchema, desc: "Diff two committed trees (added/removed/changed doc_ids)." },
-  { def: ValidateSchemaTool, schema: ValidateSchemaInputSchema, desc: "Validate a JSON payload against a file-backed JSON schema." },
-  { def: CheckSupportTool, schema: CheckSupportInputSchema, desc: "Deterministic heuristic support checker (token overlap + number consistency)." },
-  { def: RedactTool, schema: RedactInputSchema, desc: "File-backed redact policy engine (regex-based) with deterministic mapping." },
-  { def: CreateTaskTool, schema: CreateTaskInputSchema, desc: "Deterministic task creation stored in SQLite (idempotent, reference_time aware)." }
+  { def: RetrieveTool, schema: RetrieveInputSchema, desc: "BM25 keyword search over working tree chunks." },
+  { def: RetrieveWithEmbeddingsTool, schema: RetrieveWithEmbeddingsInputSchema, desc: "Hybrid BM25 + vector search over a committed tree." },
+  { def: CommitIndexTool, schema: CommitIndexInputSchema, desc: "Commit working tree into a deterministic DAG (tree/commit/refs)." },
+  { def: LogIndexTool, schema: LogIndexInputSchema, desc: "Deterministic commit history walk." },
+  { def: DiffIndexTool, schema: DiffIndexInputSchema, desc: "Deterministic diff of two commits (added/removed/changed doc IDs)." },
+  { def: BuildEmbeddingsTool, schema: BuildEmbeddingsInputSchema, desc: "Build and store embeddings for a committed tree." },
+  { def: GcArtifactsTool, schema: GcArtifactsInputSchema, desc: "Garbage collect derived artifacts not reachable from refs." },
+  { def: CheckoutIndexTool, schema: CheckoutIndexInputSchema, desc: "Checkout a committed tree into the working state." },
+  { def: CreateTaskTool, schema: CreateTaskInputSchema, desc: "Deterministic durable task creation." }
 ];
 
 export function indexSystemTools() {
   const db = store.db;
 
-  const EPOCH = "1970-01-01T00:00:00.000Z";
-
   const tx = db.transaction(() => {
-    // 1) Remove existing sys:tool rows (FTS discipline)
-    const existing = db
-      .prepare(`SELECT rowid, doc_id, text FROM chunks WHERE doc_id LIKE 'sys:tool:%'`)
-      .all() as Array<{ rowid: number; doc_id: string; text: string }>;
+    // Remove previous sys:tool entries (and clean FTS)
+    const existing = db.prepare(`
+      SELECT rowid, doc_id, text, content_hash
+      FROM chunks
+      WHERE doc_id LIKE 'sys:tool:%'
+    `).all() as Array<any>;
 
     const deleteFTS = db.prepare(`INSERT INTO chunks_fts(chunks_fts, rowid, text) VALUES('delete', ?, ?)`);
     const deleteChunk = db.prepare(`DELETE FROM chunks WHERE doc_id = ?`);
@@ -45,54 +47,53 @@ export function indexSystemTools() {
       deleteDoc.run(row.doc_id);
     }
 
-    // 2) Insert new tool manifests
     const insertDoc = db.prepare(`
       INSERT INTO documents(doc_id, content_hash, title, updated_at)
       VALUES(?, ?, ?, ?)
     `);
-
     const insertChunk = db.prepare(`
       INSERT INTO chunks(chunk_id, doc_id, text, span_start, span_end, content_hash)
       VALUES(?, ?, ?, 0, length(?), ?)
     `);
+    const insertFTS = db.prepare(`INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)`);
+    const upsertBlob = db.prepare(`INSERT OR REPLACE INTO blobs(content_hash, text) VALUES(?, ?)`);
 
-    const insertFTS = db.prepare(`
-      INSERT INTO chunks_fts(rowid, text) VALUES(?, ?)
-    `);
+    const EPOCH = "1970-01-01T00:00:00.000Z";
 
     for (const t of SYSTEM_TOOLS) {
       const docId = `sys:tool:${t.def.name}`;
-      const schemaJson = zodToJsonSchema(t.schema, t.def.name);
+      const schema = zodToJsonSchema(t.schema, t.def.name);
 
       const manifestObj = {
         tool: t.def.name,
         version: t.def.version,
         type: "System Capability",
         description: t.desc,
-        schema: schemaJson
+        schema
       };
 
       const manifestText = canonicalize(manifestObj);
       const hash = createHash("sha256").update(manifestText).digest("hex");
+
+      // Store blob so checkout can restore
+      upsertBlob.run(hash, manifestText);
 
       insertDoc.run(docId, hash, `Tool: ${t.def.name}`, EPOCH);
       const info = insertChunk.run(`${docId}#def`, docId, manifestText, manifestText, hash);
       insertFTS.run((info as any).lastInsertRowid, manifestText);
     }
 
-    // 3) Idempotent auto-commit (only if changed)
+    // Idempotent auto-commit
     const { treeHash: currentTree, entriesJson } = git.createTreeFromCurrentState(db);
-    const head = git.getRef("HEAD", db);
+    const currentHead = git.getRef("HEAD", db);
 
-    if (head) {
-      const headTree = git.getTreeHashForCommit(head, db);
-      if (headTree === currentTree) {
-        return;
-      }
+    if (currentHead) {
+      const headTree = git.getTreeHashForCommit(currentHead, db);
+      if (headTree === currentTree) return;
     }
 
     git.saveTree(currentTree, entriesJson, db);
-    const parents = head ? [head] : [];
+    const parents = currentHead ? [currentHead] : [];
     const commitHash = git.createCommit(currentTree, parents, "System Bootstrap: Tool Registry Sync", db);
     git.updateRef("main", commitHash, db);
     git.updateRef("HEAD", commitHash, db);
