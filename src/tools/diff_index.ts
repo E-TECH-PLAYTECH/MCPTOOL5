@@ -8,38 +8,29 @@ export const DiffIndexInputSchema = z.object({
   to_ref: z.string()
 });
 
-function ensureSorted(entries: Array<{ doc_id: string; content_hash: string }>) {
-  for (let i = 1; i < entries.length; i++) {
-    if (entries[i - 1].doc_id > entries[i].doc_id) return false;
-  }
-  return true;
-}
-
 export const DiffIndexTool = {
   name: "diff_index",
   version: "1.0.3",
 
   execute: async (input: z.infer<typeof DiffIndexInputSchema>) => {
-    const fromRes = git.resolveTarget(input.from_ref);
-    const toRes = git.resolveTarget(input.to_ref);
+    const fromHash = git.resolveTarget(input.from_ref);
+    const toHash = git.resolveTarget(input.to_ref);
 
-    if (!fromRes || !toRes) {
+    if (!fromHash || !toHash) {
       const missing: string[] = [];
-      if (!fromRes) missing.push(input.from_ref);
-      if (!toRes) missing.push(input.to_ref);
+      if (!fromHash) missing.push(input.from_ref);
+      if (!toHash) missing.push(input.to_ref);
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "diff_index",
         tool_version: "1.0.3",
         input,
         result: null,
-        errors: [{ code: "ERR_REF_NOT_FOUND", message: `Could not resolve: ${missing.join(", ")}` }]
+        errors: [{ code: "ERR_REF_NOT_FOUND", message: `Could not resolve refs: ${missing.join(", ")}` }]
       });
     }
 
-    const fromCommit = git.getCommit(fromRes.commit);
-    const toCommit = git.getCommit(toRes.commit);
-    if (!fromCommit || !toCommit) {
+    if (!git.getCommit(fromHash) || !git.getCommit(toHash)) {
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "diff_index",
@@ -50,9 +41,8 @@ export const DiffIndexTool = {
       });
     }
 
-    const fromTree = fromCommit.tree_hash as string | null;
-    const toTree = toCommit.tree_hash as string | null;
-
+    const fromTree = git.getTreeHashForCommit(fromHash);
+    const toTree = git.getTreeHashForCommit(toHash);
     if (!fromTree || !toTree) {
       return buildEnvelope({
         request_id: input.request_id,
@@ -60,18 +50,16 @@ export const DiffIndexTool = {
         tool_version: "1.0.3",
         input,
         result: null,
-        errors: [{ code: "ERR_TREE_HASH_MISSING", message: "Commit row missing tree_hash." }]
+        errors: [{ code: "ERR_TREE_HASH_MISSING", message: "Commit exists but tree hash is null." }]
       });
     }
 
-    let listA: Array<{ doc_id: string; content_hash: string }> | null;
-    let listB: Array<{ doc_id: string; content_hash: string }> | null;
-
+    let listA, listB;
     try {
       listA = git.getTreeEntries(fromTree);
       listB = git.getTreeEntries(toTree);
     } catch (e: any) {
-      if (e?.code === "ERR_DATA_CORRUPTION") {
+      if (e.code === "ERR_DATA_CORRUPTION") {
         return buildEnvelope({
           request_id: input.request_id,
           tool_name: "diff_index",
@@ -85,55 +73,36 @@ export const DiffIndexTool = {
     }
 
     if (listA === null || listB === null) {
-      const missingTrees: string[] = [];
-      if (listA === null) missingTrees.push(fromTree);
-      if (listB === null) missingTrees.push(toTree);
+      const missing: string[] = [];
+      if (listA === null) missing.push(fromTree);
+      if (listB === null) missing.push(toTree);
       return buildEnvelope({
         request_id: input.request_id,
         tool_name: "diff_index",
         tool_version: "1.0.3",
         input,
         result: null,
-        errors: [{ code: "ERR_TREE_NOT_FOUND", message: `Missing tree rows: ${missingTrees.join(", ")}` }]
+        errors: [{ code: "ERR_TREE_NOT_FOUND", message: `Tree data missing: ${missing.join(", ")}` }]
       });
     }
 
-    if (!ensureSorted(listA) || !ensureSorted(listB)) {
-      return buildEnvelope({
-        request_id: input.request_id,
-        tool_name: "diff_index",
-        tool_version: "1.0.3",
-        input,
-        result: null,
-        errors: [{ code: "ERR_DATA_CORRUPTION", message: "Tree entries are not sorted by doc_id.", path: "entries_json" }]
-      });
-    }
+    // Diff at doc_id granularity based on doc_content_hash
+    const aDocs = new Map<string, string>();
+    const bDocs = new Map<string, string>();
+    for (const e of listA) aDocs.set(e.doc_id, e.doc_content_hash);
+    for (const e of listB) bDocs.set(e.doc_id, e.doc_content_hash);
 
+    const all = [...new Set([...aDocs.keys(), ...bDocs.keys()])].sort();
     const added: string[] = [];
     const removed: string[] = [];
     const changed: string[] = [];
 
-    let i = 0, j = 0;
-    while (i < listA.length || j < listB.length) {
-      const a = listA[i];
-      const b = listB[j];
-
-      if (!a) {
-        added.push(b.doc_id);
-        j++;
-      } else if (!b) {
-        removed.push(a.doc_id);
-        i++;
-      } else if (a.doc_id === b.doc_id) {
-        if (a.content_hash !== b.content_hash) changed.push(a.doc_id);
-        i++; j++;
-      } else if (a.doc_id < b.doc_id) {
-        removed.push(a.doc_id);
-        i++;
-      } else {
-        added.push(b.doc_id);
-        j++;
-      }
+    for (const doc of all) {
+      const ah = aDocs.get(doc);
+      const bh = bDocs.get(doc);
+      if (ah === undefined && bh !== undefined) added.push(doc);
+      else if (ah !== undefined && bh === undefined) removed.push(doc);
+      else if (ah !== bh) changed.push(doc);
     }
 
     return buildEnvelope({
@@ -142,16 +111,14 @@ export const DiffIndexTool = {
       tool_version: "1.0.3",
       input,
       result: {
-        from_commit: fromRes.commit,
-        to_commit: toRes.commit,
-        from_tree: fromTree,
-        to_tree: toTree,
+        from_commit: fromHash,
+        to_commit: toHash,
         stats: { added: added.length, removed: removed.length, changed: changed.length },
         diff: { added, removed, changed }
       },
       provenance: [
-        { source_type: "index", source_id: `commits/${fromRes.commit}`, index_version: fromRes.commit },
-        { source_type: "index", source_id: `commits/${toRes.commit}`, index_version: toRes.commit },
+        { source_type: "index", source_id: `commits/${fromHash}`, index_version: fromHash },
+        { source_type: "index", source_id: `commits/${toHash}`, index_version: toHash },
         { source_type: "index", source_id: `trees/${fromTree}`, content_hash: fromTree },
         { source_type: "index", source_id: `trees/${toTree}`, content_hash: toTree }
       ]

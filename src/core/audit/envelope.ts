@@ -25,22 +25,19 @@ export interface EnvelopeOptions {
   errors?: Array<{ code: string; message: string; path?: string; data?: unknown }>;
 }
 
-/**
- * Global Response Envelope.
- * outputs_hash is computed over `result` ONLY to remain stable regardless of request_id/timestamps.
- */
+const SERVER_VERSION = "1.0.0";
+
 export function buildEnvelope(opts: EnvelopeOptions) {
-  const serverVersion = opts.server_version ?? "1.0.0";
   const requestId = opts.request_id ?? uuidv4();
 
   const inputs_hash = computeHash(opts.input);
   const outputs_hash = computeHash(opts.result);
 
-  return {
+  const envelope = {
     request_id: requestId,
     tool_name: opts.tool_name,
     tool_version: opts.tool_version,
-    server_version: serverVersion,
+    server_version: opts.server_version ?? SERVER_VERSION,
     inputs_hash,
     outputs_hash,
     result: opts.result,
@@ -51,4 +48,29 @@ export function buildEnvelope(opts: EnvelopeOptions) {
       timestamp: new Date().toISOString()
     }
   };
+
+  // Best-effort audit write (never throws; tool output must still return)
+  queueMicrotask(async () => {
+    try {
+      const mod = await import("../store/db.js");
+      const db = mod.store.db;
+      db.prepare(`
+        INSERT OR REPLACE INTO audit_log(
+          request_id, tool_name, tool_version, inputs_hash, outputs_hash, envelope_json, created_at
+        ) VALUES(?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        envelope.request_id,
+        envelope.tool_name,
+        envelope.tool_version,
+        envelope.inputs_hash,
+        envelope.outputs_hash,
+        JSON.stringify(envelope),
+        envelope.metrics.timestamp
+      );
+    } catch {
+      // swallow
+    }
+  });
+
+  return envelope;
 }

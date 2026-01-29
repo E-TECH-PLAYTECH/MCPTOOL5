@@ -12,30 +12,27 @@ export const RetrieveInputSchema = z.object({
 
 export const RetrieveTool = {
   name: "retrieve",
-  version: "1.2.2",
+  version: "1.3.0",
 
   execute: async (input: z.infer<typeof RetrieveInputSchema>) => {
-    const headCommit = store.getHead();
+    const headCommit = store.getIndexVersion();
     const { treeHash: currentTree } = git.createTreeFromCurrentState();
 
-    let effectiveVersion = headCommit ?? currentTree;
-    const warnings: Array<{ code: string; message: string; data?: unknown }> = [];
+    let effectiveVersion = headCommit || currentTree;
+    const warnings: any[] = [];
 
     if (!headCommit) {
-      warnings.push({ code: "WARN_NO_COMMITS", message: "No commits exist; serving current working tree." });
+      warnings.push({ code: "WARN_NO_COMMITS", message: "No history found; serving working tree." });
     } else {
       const headTree = git.getTreeHashForCommit(headCommit);
       if (headTree !== currentTree) {
-        warnings.push({ code: "WARN_WORKING_TREE_DIRTY", message: "Serving uncommitted working tree changes." });
+        warnings.push({ code: "WARN_WORKING_TREE_DIRTY", message: "Serving uncommitted working tree." });
         effectiveVersion = currentTree;
       }
     }
 
     if (input.index_version && input.index_version !== effectiveVersion) {
-      warnings.push({
-        code: "WARN_VERSION_MISMATCH",
-        message: `Requested ${input.index_version}, serving ${effectiveVersion}`
-      });
+      warnings.push({ code: "WARN_VERSION_MISMATCH", message: `Requested ${input.index_version}, serving ${effectiveVersion}` });
     }
 
     const rows = store.search(input.query, input.k);
@@ -43,7 +40,7 @@ export const RetrieveTool = {
     const chunks = rows.map((row: any) => ({
       chunk_id: row.chunk_id,
       doc_id: row.doc_id,
-      title: row.title,
+      title: row.title ?? null,
       text: row.text,
       score: row.score,
       span: { start: row.span_start ?? 0, end: row.span_end ?? row.text.length },
@@ -56,14 +53,13 @@ export const RetrieveTool = {
       artifact_id: row.chunk_id,
       score: row.score,
       index_version: effectiveVersion,
-      content_hash: row.content_hash,
-      span: { start: row.span_start ?? 0, end: row.span_end ?? row.text.length }
+      content_hash: row.content_hash
     }));
 
     return buildEnvelope({
       request_id: input.request_id,
       tool_name: "retrieve",
-      tool_version: "1.2.2",
+      tool_version: "1.3.0",
       input,
       result: { chunks, index_version: effectiveVersion },
       provenance,
