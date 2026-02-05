@@ -10,8 +10,10 @@ import { LogIndexTool, LogIndexInputSchema } from "./tools/log_index.js";
 import { DiffIndexTool, DiffIndexInputSchema } from "./tools/diff_index.js";
 import { CreateTaskTool, CreateTaskInputSchema } from "./tools/create_task.js";
 import { BuildEmbeddingsTool, BuildEmbeddingsInputSchema } from "./tools/build_embeddings.js";
+import { BuildFtsTreeTool, BuildFtsTreeInputSchema } from "./tools/build_fts_tree.js";
 import { GcArtifactsTool, GcArtifactsInputSchema } from "./tools/gc_artifacts.js";
 import { CheckoutIndexTool, CheckoutIndexInputSchema } from "./tools/checkout_index.js";
+import { ValidateFtsTool, ValidateFtsInputSchema } from "./tools/validate_fts.js";
 
 indexSystemTools();
 
@@ -47,8 +49,10 @@ register(LogIndexTool, LogIndexInputSchema);
 register(DiffIndexTool, DiffIndexInputSchema);
 register(CreateTaskTool, CreateTaskInputSchema);
 register(BuildEmbeddingsTool, BuildEmbeddingsInputSchema);
+register(BuildFtsTreeTool, BuildFtsTreeInputSchema);
 register(GcArtifactsTool, GcArtifactsInputSchema);
 register(CheckoutIndexTool, CheckoutIndexInputSchema);
+register(ValidateFtsTool, ValidateFtsInputSchema);
 
 async function main() {
   const transport = new StdioServerTransport();

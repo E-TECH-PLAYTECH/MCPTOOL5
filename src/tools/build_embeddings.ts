@@ -100,9 +100,8 @@ export const BuildEmbeddingsTool = {
       const upsert = db.prepare(`
         INSERT INTO chunk_embeddings(tree_hash, chunk_id, embedding, model_id, dims, content_hash)
         VALUES(?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tree_hash, chunk_id) DO UPDATE SET
+        ON CONFLICT(tree_hash, chunk_id, model_id) DO UPDATE SET
           embedding=excluded.embedding,
-          model_id=excluded.model_id,
           dims=excluded.dims,
           content_hash=excluded.content_hash
       `);
@@ -131,20 +130,18 @@ export const BuildEmbeddingsTool = {
         .digest("hex");
 
       db.prepare(`
-        INSERT INTO index_artifacts(artifact_id, tree_hash, kind, manifest_json, content_hash, created_at)
-        VALUES(?, ?, ?, ?, ?, ?)
-        ON CONFLICT(tree_hash, kind) DO UPDATE SET
-          artifact_id=excluded.artifact_id,
-          manifest_json=excluded.manifest_json,
-          content_hash=excluded.content_hash,
-          created_at=excluded.created_at
-      `).run(artifact_id, treeHash, KIND, manifest_json, manifest_hash, EPOCH);
+        INSERT OR REPLACE INTO index_artifacts(artifact_id, tree_hash, kind, model_id, manifest_json, content_hash, created_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?)
+      `).run(artifact_id, treeHash, KIND, provider.id, manifest_json, manifest_hash, EPOCH);
 
-      db.prepare(`
-        INSERT INTO artifact_refs(ref_name, artifact_id, kind)
-        VALUES(?, ?, ?)
-        ON CONFLICT(ref_name, kind) DO UPDATE SET artifact_id=excluded.artifact_id
-      `).run(input.ref, artifact_id, KIND);
+      const upsertRef = db.prepare(
+        `INSERT INTO artifact_refs(ref_type, ref_name, artifact_id, kind)
+         VALUES(?, ?, ?, ?)
+         ON CONFLICT(ref_type, ref_name, kind) DO UPDATE SET artifact_id = excluded.artifact_id`
+      );
+
+      upsertRef.run("commit", resolved, artifact_id, KIND);
+      if (input.ref === "HEAD" || input.ref === "main") upsertRef.run("ref", input.ref, artifact_id, KIND);
 
       return { ok: true as const, artifact_id, manifest_hash, dims, chunk_count: vectors.length };
     });
