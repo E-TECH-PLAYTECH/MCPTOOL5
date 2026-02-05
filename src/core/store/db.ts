@@ -134,7 +134,7 @@ export class LocalStore {
       -- A. Maintenance Gate (Singleton)
       CREATE TABLE IF NOT EXISTS fts_maintenance (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        enabled INTEGER NOT NULL CHECK(enabled IN (0,1))
+        enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0,1))
       );
       INSERT OR IGNORE INTO fts_maintenance(id, enabled) VALUES (1, 0);
 
@@ -172,9 +172,6 @@ export class LocalStore {
       -- C. Virtual Index
       CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks_fts USING fts5(
         text,
-        tree_hash UNINDEXED,
-        chunk_id  UNINDEXED,
-        doc_id    UNINDEXED,
         content='fts_chunks',
         content_rowid='rowid',
         tokenize='unicode61'
