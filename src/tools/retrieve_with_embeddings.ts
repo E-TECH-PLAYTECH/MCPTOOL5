@@ -36,6 +36,19 @@ export const RetrieveWithEmbeddingsTool = {
 
   execute: async (input: z.infer<typeof RetrieveWithEmbeddingsInputSchema>) => {
     const db = store.db;
+    const search = (query: string, k: number, treeHash: string) =>
+      db.prepare(`
+        SELECT
+          c.chunk_id, c.doc_id, c.text, c.span_start, c.span_end, c.content_hash,
+          d.title,
+          bm25(fts_chunks_fts) as score
+        FROM fts_chunks_fts
+        JOIN fts_chunks c ON fts_chunks_fts.rowid = c.rowid
+        LEFT JOIN documents d ON d.doc_id = c.doc_id
+        WHERE fts_chunks_fts MATCH @query AND c.tree_hash = @treeHash
+        ORDER BY bm25(fts_chunks_fts), c.chunk_id ASC
+        LIMIT @k
+      `).all({ query, k, treeHash });
 
     const commit = git.resolveTarget(input.ref);
     if (!commit) {
@@ -61,13 +74,15 @@ export const RetrieveWithEmbeddingsTool = {
       });
     }
 
+    const provider = embeddingRegistry.get(input.provider_id);
+
     // Ensure embeddings exist for this tree/provider
     const artifact = db.prepare(`
       SELECT artifact_id, manifest_json, content_hash
       FROM index_artifacts
-      WHERE tree_hash = ? AND kind = 'chunk_embeddings'
+      WHERE tree_hash = ? AND kind = 'chunk_embeddings' AND model_id = ?
       LIMIT 1
-    `).get(treeHash) as any;
+    `).get(treeHash, provider.id) as any;
 
     if (!artifact) {
       return buildEnvelope({
@@ -84,8 +99,6 @@ export const RetrieveWithEmbeddingsTool = {
       });
     }
 
-    const provider = embeddingRegistry.get(input.provider_id);
-
     // Embed the query
     const q = await provider.embed({
       inputs: [input.query],
@@ -95,7 +108,7 @@ export const RetrieveWithEmbeddingsTool = {
     const qVec = new Float32Array(q.vectors[0]);
 
     // BM25 candidates (deterministic)
-    const bm25Rows = store.search(input.query, input.bm25_k) as Array<any>;
+    const bm25Rows = search(input.query, input.bm25_k, treeHash) as Array<any>;
 
     // Vector candidates: scan embeddings for this tree/provider (deterministic order)
     // Provider/dims pinned at row-level; we filter to provider + dims match.
@@ -104,8 +117,8 @@ export const RetrieveWithEmbeddingsTool = {
              c.doc_id, c.text, c.span_start, c.span_end, c.content_hash AS chunk_content_hash,
              d.title
       FROM chunk_embeddings e
-      JOIN chunks c ON c.chunk_id = e.chunk_id
-      JOIN documents d ON d.doc_id = c.doc_id
+      JOIN fts_chunks c ON c.tree_hash = e.tree_hash AND c.chunk_id = e.chunk_id
+      LEFT JOIN documents d ON d.doc_id = c.doc_id
       WHERE e.tree_hash = ? AND e.model_id = ?
       ORDER BY e.chunk_id ASC
     `).all(treeHash, provider.id) as Array<any>;

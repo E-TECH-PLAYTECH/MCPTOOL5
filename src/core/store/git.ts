@@ -55,6 +55,37 @@ export class GitOps {
     return { treeHash, entriesJson, rowCount: entries.length };
   }
 
+  public buildDocumentText(chunks: Array<{ span_start: number | null; span_end: number | null; text: string }>) {
+    if (chunks.length === 0) return "";
+
+    const normalized = chunks.map((chunk) => {
+      const start = chunk.span_start ?? 0;
+      const text = String(chunk.text);
+      const end = chunk.span_end ?? (start + text.length);
+      return { start, end, text };
+    });
+
+    let length = 0;
+    for (const c of normalized) {
+      length = Math.max(length, c.end, c.start + c.text.length);
+    }
+
+    const chars = Array(length).fill(" ");
+    for (const c of normalized) {
+      for (let i = 0; i < c.text.length; i++) {
+        const idx = c.start + i;
+        if (idx >= chars.length) {
+          const oldLen = chars.length;
+          chars.length = idx + 1;
+          chars.fill(" ", oldLen);
+        }
+        chars[idx] = c.text[i];
+      }
+    }
+
+    return chars.join("");
+  }
+
   public getRef(refName: string, db?: Db): string | null {
     const useDb = this.getDb(db);
     const row = useDb.prepare("SELECT commit_hash FROM refs WHERE ref_name = ?").get(refName);
@@ -133,7 +164,7 @@ export class GitOps {
 
   /**
    * Checkout: rewrite working tree tables to match a tree snapshot.
-   * Requires blobs(content_hash -> text) for every chunk_content_hash.
+   * Requires blobs(blob_hash -> bytes) for every tree_docs blob_hash.
    */
   public materializeTree(treeHash: string, db?: Db) {
     const useDb = this.getDb(db);
@@ -145,15 +176,51 @@ export class GitOps {
       throw err;
     }
 
-    // Validate blobs exist for all chunk hashes
-    const getBlob = useDb.prepare("SELECT text FROM blobs WHERE content_hash = ?");
-    for (const e of entries) {
-      const blob = getBlob.get(e.chunk_content_hash) as any;
+    const docRows = useDb.prepare(
+      `SELECT doc_id, blob_hash, content_hash
+       FROM tree_docs
+       WHERE tree_hash = ?
+       ORDER BY doc_id ASC`
+    ).all(treeHash) as Array<any>;
+
+    if (docRows.length === 0) {
+      const err = new Error(`Missing tree_docs for tree ${treeHash}`);
+      (err as any).code = "ERR_TREE_DOCS_MISSING";
+      (err as any).path = "tree_docs";
+      throw err;
+    }
+
+    const chunkRows = useDb.prepare(
+      `SELECT chunk_id, doc_id, span_start, span_end, content_hash
+       FROM tree_chunks
+       WHERE tree_hash = ?
+       ORDER BY doc_id ASC, chunk_id ASC`
+    ).all(treeHash) as Array<any>;
+
+    if (chunkRows.length === 0) {
+      const err = new Error(`Missing tree_chunks for tree ${treeHash}`);
+      (err as any).code = "ERR_TREE_CHUNKS_MISSING";
+      (err as any).path = "tree_chunks";
+      throw err;
+    }
+
+    const blobByDoc = new Map<string, Buffer>();
+    const getBlob = useDb.prepare("SELECT bytes FROM blobs WHERE blob_hash = ?");
+    for (const doc of docRows) {
+      const blob = getBlob.get(doc.blob_hash) as any;
       if (!blob) {
-        const err = new Error(`Missing blob for chunk content_hash ${e.chunk_content_hash}`);
+        const err = new Error(`Missing blob for doc ${doc.doc_id}`);
         (err as any).code = "ERR_BLOB_MISSING";
         (err as any).path = "blobs";
         throw err;
+      }
+      blobByDoc.set(String(doc.doc_id), Buffer.from(blob.bytes));
+    }
+
+    const titleByDoc = new Map<string, string | null>();
+    for (const entry of entries) {
+      if (!titleByDoc.has(entry.doc_id)) {
+        titleByDoc.set(entry.doc_id, entry.title ?? null);
       }
     }
 
@@ -170,22 +237,30 @@ export class GitOps {
       VALUES(?, ?, ?, ?, ?, ?)
     `);
 
-    const seenDocs = new Set<string>();
     const epoch = "1970-01-01T00:00:00.000Z";
+    const seenDocs = new Set<string>();
 
-    for (const e of entries) {
-      if (!seenDocs.has(e.doc_id)) {
-        insertDoc.run(e.doc_id, e.doc_content_hash, e.title, epoch);
-        seenDocs.add(e.doc_id);
+    for (const doc of docRows) {
+      const docId = String(doc.doc_id);
+      if (!seenDocs.has(docId)) {
+        insertDoc.run(docId, String(doc.content_hash), titleByDoc.get(docId) ?? null, epoch);
+        seenDocs.add(docId);
       }
-      const blob = getBlob.get(e.chunk_content_hash) as any;
+    }
+
+    for (const chunk of chunkRows) {
+      const docId = String(chunk.doc_id);
+      const docText = blobByDoc.get(docId)!.toString("utf-8");
+      const spanStart = Number(chunk.span_start);
+      const spanEnd = Number(chunk.span_end);
+      const chunkText = docText.substring(spanStart, spanEnd);
       insertChunk.run(
-        e.chunk_id,
-        e.doc_id,
-        String(blob.text),
-        e.span_start,
-        e.span_end,
-        e.chunk_content_hash
+        String(chunk.chunk_id),
+        docId,
+        chunkText,
+        spanStart,
+        spanEnd,
+        String(chunk.content_hash)
       );
     }
 

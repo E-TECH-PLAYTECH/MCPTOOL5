@@ -15,6 +15,21 @@ export const RetrieveTool = {
   version: "1.3.0",
 
   execute: async (input: z.infer<typeof RetrieveInputSchema>) => {
+    const db = store.db;
+    const search = (query: string, k: number) =>
+      db.prepare(`
+        SELECT
+          c.chunk_id, c.doc_id, c.text, c.span_start, c.span_end, c.content_hash,
+          d.title,
+          bm25(chunks_fts) as score
+        FROM chunks_fts
+        JOIN chunks c ON chunks_fts.rowid = c.rowid
+        JOIN documents d ON c.doc_id = d.doc_id
+        WHERE chunks_fts MATCH @query
+        ORDER BY bm25(chunks_fts), c.chunk_id ASC
+        LIMIT @k
+      `).all({ query, k });
+
     const headCommit = store.getIndexVersion();
     const { treeHash: currentTree } = git.createTreeFromCurrentState();
 
@@ -35,7 +50,7 @@ export const RetrieveTool = {
       warnings.push({ code: "WARN_VERSION_MISMATCH", message: `Requested ${input.index_version}, serving ${effectiveVersion}` });
     }
 
-    const rows = store.search(input.query, input.k);
+    const rows = search(input.query, input.k);
 
     const chunks = rows.map((row: any) => ({
       chunk_id: row.chunk_id,

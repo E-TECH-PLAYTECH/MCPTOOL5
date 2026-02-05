@@ -41,7 +41,7 @@ export const CheckoutIndexTool = {
       });
     }
 
-    // Preflight: ensure tree exists and blobs exist for entries
+    // Preflight: ensure tree exists and blobs exist for tree docs
     let entries;
     try {
       entries = git.getTreeEntries(treeHash, db);
@@ -70,12 +70,37 @@ export const CheckoutIndexTool = {
       });
     }
 
+    const docRows = db.prepare(
+      `SELECT doc_id, blob_hash
+       FROM tree_docs
+       WHERE tree_hash = ?
+       ORDER BY doc_id ASC`
+    ).all(treeHash) as Array<any>;
+
+    const chunkRows = db.prepare(
+      `SELECT chunk_id
+       FROM tree_chunks
+       WHERE tree_hash = ?
+       LIMIT 1`
+    ).get(treeHash);
+
+    if (docRows.length === 0 || !chunkRows) {
+      return buildEnvelope({
+        request_id: input.request_id,
+        tool_name: "checkout_index",
+        tool_version: "1.0.0",
+        input,
+        result: null,
+        errors: [{ code: "ERR_TREE_PAYLOAD_MISSING", message: `tree_docs/tree_chunks missing for tree ${treeHash}` }]
+      });
+    }
+
     // Blob coverage check
-    const getBlob = db.prepare(`SELECT 1 FROM blobs WHERE content_hash = ?`);
+    const getBlob = db.prepare(`SELECT 1 FROM blobs WHERE blob_hash = ?`);
     const missingBlobs: string[] = [];
-    for (const e of entries) {
-      const ok = getBlob.get(e.chunk_content_hash);
-      if (!ok) missingBlobs.push(e.chunk_content_hash);
+    for (const doc of docRows) {
+      const ok = getBlob.get(doc.blob_hash);
+      if (!ok) missingBlobs.push(String(doc.blob_hash));
     }
 
     if (missingBlobs.length > 0) {
